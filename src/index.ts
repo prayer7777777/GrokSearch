@@ -429,21 +429,22 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       if (!requestedModel) return json(fail("invalid_input", "Model must not be empty."));
 
       const previousModel = currentGrokModel(env, this.state);
-      const listed = await listGrokModels(env);
-      let validation: Record<string, unknown> = { checked: false };
+      const nextState: AgentState = {
+        ...(this.state || DEFAULT_STATE),
+        sessions: { ...(this.state?.sessions || {}) },
+        selected_model: requestedModel,
+      };
+      this.setState(nextState);
 
-      if ("error" in listed) {
-        validation = { checked: false, warning: "Could not validate model against /models; switching anyway.", details: listed.error };
-      } else {
-        const availableModels = listed.models.map((item) => item.id);
-        if (!availableModels.includes(requestedModel)) {
-          return json(fail("model_not_found", `Model '${requestedModel}' was not returned by /models.`, { available_models: availableModels, checked: true }));
-        }
-        validation = { checked: true, available_count: listed.count };
-      }
-
-      this.setState({ ...(this.state || DEFAULT_STATE), sessions: { ...(this.state?.sessions || {}) }, selected_model: requestedModel });
-      return json({ previous_model: previousModel, current_model: requestedModel, default_model: defaultGrokModel(env), validation });
+      return json({
+        previous_model: previousModel,
+        current_model: requestedModel,
+        default_model: defaultGrokModel(env),
+        validation: {
+          checked: false,
+          reason: "switch_model does not call /models. Use list_models before switching if validation is required.",
+        },
+      });
     });
 
     this.server.registerTool("web_fetch", {
