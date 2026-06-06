@@ -55,7 +55,7 @@ Use `switch_model` to change the model for the current MCP session:
 }
 ```
 
-`switch_model` first tries to validate the requested model against `GET ${GROK_API_URL}/models`. If that endpoint is unavailable, the tool records a warning and still switches the session model. This does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model.
+`switch_model` is intentionally a local session state update. It does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model. Use `list_models` before `switch_model` when validation is required.
 
 ## Local setup
 
@@ -135,7 +135,7 @@ If `MCP_SHARED_TOKEN` is enabled, configure the client-side authorization mechan
 2. MCP Inspector should list seven tools.
 3. `get_config_info` should show configured providers without leaking key values.
 4. `list_models` should return the model list from the configured Grok-compatible API.
-5. `switch_model` should update the current MCP session model.
+5. `switch_model` should update the current MCP session model without calling the models API.
 6. `web_search` should return `answer`, `session_id`, `sources_count`, and the model used.
 7. `get_sources` should return the cached source list from the same MCP session.
 8. `web_fetch` should return page content when Tavily or Firecrawl is configured.
