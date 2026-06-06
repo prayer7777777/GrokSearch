@@ -174,7 +174,7 @@ async function listGrokModels(env: Env): Promise<{ api_url: string; models: Grok
   }, 30000);
 
   if (!response.ok) {
-    return fail("provider_error", `Grok models API returned HTTP ${response.status}.", { provider: "grok", status: response.status, retryable: response.status === 429 || response.status >= 500 });
+    return fail("provider_error", `Grok models API returned HTTP ${response.status}.`, { provider: "grok", status: response.status, retryable: response.status === 429 || response.status >= 500 });
   }
 
   const models = normalizeGrokModels(response.data);
@@ -306,7 +306,7 @@ async function callGrok(env: Env, model: string, query: string, opts: { max_sour
     const fallback = await callChatCompletions();
     if (fallback.ok || !response.ok) response = fallback;
   }
-  if (!response.ok) return fail("provider_error", `Grok API returned HTTP ${response.status}.", { provider: "grok", status: response.status, retryable: response.status === 429 || response.status >= 500 });
+  if (!response.ok) return fail("provider_error", `Grok API returned HTTP ${response.status}.`, { provider: "grok", status: response.status, retryable: response.status === 429 || response.status >= 500 });
   const answer = textFrom(response.data).trim() || "No textual answer was returned.";
   const structuredSources = sourcesFrom(response.data, "grok", maxSources);
   const textSources = sourcesFromText(answer, "grok", Math.max(maxSources - structuredSources.length, 0));
@@ -347,7 +347,7 @@ async function firecrawlScrape(env: Env, url: string, format: "markdown" | "text
     headers: { Authorization: `Bearer ${env.FIRECRAWL_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({ url, formats: [format === "html" ? "html" : "markdown"] }),
   }, 45000);
-  if (!response.ok) return fail("provider_error", `Firecrawl API returned HTTP ${response.status}.", { provider: "firecrawl", status: response.status, retryable: response.status === 429 || response.status >= 500 });
+  if (!response.ok) return fail("provider_error", `Firecrawl API returned HTTP ${response.status}.`, { provider: "firecrawl", status: response.status, retryable: response.status === 429 || response.status >= 500 });
   const data = rec(rec(response.data).data || response.data);
   const metadata = rec(data.metadata);
   const content = format === "html" && typeof data.html === "string" ? data.html : typeof data.markdown === "string" ? data.markdown : typeof data.content === "string" ? data.content : typeof data.summary === "string" ? data.summary : "";
@@ -363,7 +363,7 @@ async function tavilyMap(env: Env, url: string, input: { instructions?: string; 
     headers: { Authorization: `Bearer ${env.TAVILY_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({ url, instructions: input.instructions || undefined, max_depth: Math.min(Math.max(input.max_depth || 1, 1), 5), limit }),
   }, 45000);
-  if (!response.ok) return fail("provider_error", `Tavily Map returned HTTP ${response.status}.", { provider: "tavily", status: response.status, retryable: response.status === 429 || response.status >= 500 });
+  if (!response.ok) return fail("provider_error", `Tavily Map returned HTTP ${response.status}.`, { provider: "tavily", status: response.status, retryable: response.status === 429 || response.status >= 500 });
   const data = rec(response.data);
   const urls = (Array.isArray(data.results) ? data.results : []).filter((item): item is string => typeof item === "string").slice(0, limit);
   return { base_url: typeof data.base_url === "string" ? data.base_url : url, urls, count: urls.length, provider: "tavily" };
@@ -437,7 +437,7 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       } else {
         const availableModels = listed.models.map((item) => item.id);
         if (!availableModels.includes(requestedModel)) {
-          return json(fail("model_not_found", `Model '${requestedModel}' was not returned by /models.", { available_models: availableModels, checked: true }));
+          return json(fail("model_not_found", `Model '${requestedModel}' was not returned by /models.`, { available_models: availableModels, checked: true }));
         }
         validation = { checked: true, available_count: listed.count };
       }
