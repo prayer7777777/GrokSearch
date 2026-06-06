@@ -98,16 +98,43 @@ function rec(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }
 
+function textFromRaw(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.startsWith("<")) return "";
+  try {
+    return textFrom(JSON.parse(trimmed));
+  } catch {}
+  if (!trimmed.includes("data:")) return trimmed;
+  const chunks: string[] = [];
+  for (const line of trimmed.split(/\r?\n/)) {
+    const item = line.trim();
+    if (!item.startsWith("data:")) continue;
+    const data = item.slice(5).trim();
+    if (!data || data === "[DONE]") continue;
+    try {
+      const text = textFrom(JSON.parse(data));
+      if (text) chunks.push(text);
+    } catch {}
+  }
+  return chunks.join("");
+}
+
 function textFrom(value: unknown): string {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.map(textFrom).filter(Boolean).join("\n");
   const o = rec(value);
+  if (o.message) return textFrom(o.message);
   if (typeof o.output_text === "string") return o.output_text;
+  if (typeof o.answer === "string") return o.answer;
+  if (typeof o.result === "string") return o.result;
+  if (typeof o.response === "string") return o.response;
   if (typeof o.text === "string") return o.text;
   if (typeof o.content === "string") return o.content;
   if (Array.isArray(o.content)) return textFrom(o.content);
   if (Array.isArray(o.output)) return textFrom(o.output);
-  if (Array.isArray(o.choices)) return o.choices.map((c) => textFrom(rec(rec(c).message).content || rec(c).text || c)).filter(Boolean).join("\n");
+  if (Array.isArray(o.data)) return textFrom(o.data);
+  if (Array.isArray(o.choices)) return o.choices.map((c) => textFrom(rec(c).message ?? rec(c).delta ?? rec(c).text ?? c)).filter(Boolean).join("\n");
+  if (typeof o.raw === "string") return textFromRaw(o.raw);
   return "";
 }
 
@@ -142,6 +169,26 @@ function sourcesFrom(value: unknown, provider: Source["provider"], limit: number
   return out;
 }
 
+function sourcesFromText(text: string, provider: Source["provider"], limit: number): Source[] {
+  const seen = new Set<string>();
+  const out: Source[] = [];
+  const markdownLink = /\[[^\]]+\]\((https?:\/\/[^)\s]+)\)/g;
+  const bareUrl = /https?:\/\/[^\s)\]]+/g;
+  for (const pattern of [markdownLink, bareUrl]) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(text)) && out.length < limit) {
+      const rawUrl = match[1] || match[0];
+      try {
+        const url = normalizeHttpUrl(rawUrl);
+        if (seen.has(url)) continue;
+        seen.add(url);
+        out.push({ id: crypto.randomUUID(), url, provider, retrieved_at: now() });
+      } catch {}
+    }
+  }
+  return out;
+}
+
 function injectTimeContext(query: string) {
   const terms = ["latest", "recent", "today", "current", "now", "最新", "今天", "当前", "最近", "实时"];
   const lower = query.toLowerCase();
@@ -160,20 +207,40 @@ async function callGrok(env: Env, query: string, opts: { max_sources?: number; a
     input: injectTimeContext(query),
     tools: [{ type: "web_search", max_search_results: maxSources, allowed_domains: opts.allowed_domains, excluded_domains: opts.excluded_domains, include_images: opts.include_images }],
   };
-  let response = await fetchJson(`${base}/responses`, { method: "POST", headers, body: JSON.stringify(body) }, 60000);
-  if (!response.ok && [404, 405, 422].includes(response.status)) {
-    response = await fetchJson(`${base}/chat/completions`, {
+  const callChatCompletions = () => fetchJson(`${base}/chat/completions`, {
       method: "POST",
       headers,
       body: JSON.stringify({
         model,
         messages: [{ role: "user", content: injectTimeContext(query) }],
+        stream: true,
         search_parameters: { mode: "auto", max_search_results: maxSources, allowed_domains: opts.allowed_domains, excluded_domains: opts.excluded_domains },
       }),
     }, 60000);
+  let response = await fetchJson(`${base}/responses`, { method: "POST", headers, body: JSON.stringify(body) }, 60000);
+  if (!response.ok) {
+    response = await callChatCompletions();
+  } else if (response.ok && !textFrom(response.data).trim()) {
+    const fallback = await callChatCompletions();
+    if (fallback.ok || !response.ok) response = fallback;
   }
   if (!response.ok) return fail("provider_error", `Grok API returned HTTP ${response.status}.`, { provider: "grok", status: response.status, retryable: response.status === 429 || response.status >= 500 });
-  return { answer: textFrom(response.data).trim() || "No textual answer was returned.", sources: sourcesFrom(response.data, "grok", maxSources), model };
+  const answer = textFrom(response.data).trim() || "No textual answer was returned.";
+  const structuredSources = sourcesFrom(response.data, "grok", maxSources);
+  const textSources = sourcesFromText(answer, "grok", Math.max(maxSources - structuredSources.length, 0));
+  let sources = [...structuredSources, ...textSources];
+  if (!sources.length && env.TAVILY_API_KEY) sources = await tavilySearchSources(env, query, maxSources);
+  return { answer, sources, model };
+}
+
+async function tavilySearchSources(env: Env, query: string, maxResults: number): Promise<Source[]> {
+  const response = await fetchJson(`${trimSlash(env.TAVILY_API_URL || "https://api.tavily.com")}/search`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.TAVILY_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, max_results: maxResults, search_depth: "basic", include_answer: false }),
+  }, 30000);
+  if (!response.ok) return [];
+  return sourcesFrom(response.data, "tavily", maxResults);
 }
 
 async function tavilyExtract(env: Env, url: string, format: "markdown" | "text" | "html"): Promise<FetchResult | null> {
