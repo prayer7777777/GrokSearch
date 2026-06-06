@@ -31,6 +31,8 @@ Cloudflare's `McpAgent.serve('/mcp')` handles Streamable HTTP transport. The Wor
 | `web_map` | Discovers site URLs through Tavily Map. |
 | `get_config_info` | Returns non-secret configuration diagnostics, including default, selected, and current model names. |
 
+Compatibility probe note: `get_sources`, `switch_model`, and `web_map` currently return a deliberately small `mode: "chatgpt_minimal_probe"` response. This is used to isolate ChatGPT connector transport resets from storage reads, state writes, and external Tavily calls. Re-enable the full implementations one layer at a time only after ChatGPT confirms these minimal responses no longer interrupt the tool channel.
+
 Not ported in this version: `toggle_builtin_tools`, Claude Code settings mutation, parent process monitoring, and local config-file persistence.
 
 ## Model selection
@@ -57,7 +59,7 @@ Use `switch_model` to change the model for the current MCP session:
 }
 ```
 
-`switch_model` is intentionally a Durable Object session storage update. It does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, does not use Agent state synchronization, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model. Use `list_models` before `switch_model` when validation is required.
+`switch_model` is temporarily in minimal ChatGPT compatibility probe mode. It echoes the requested model but does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, does not use Agent state synchronization, does not write storage, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model.
 
 Search result source URLs are normalized, deduplicated, and stripped of common Markdown/citation tails before being stored.
 

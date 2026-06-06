@@ -426,9 +426,14 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Return source metadata cached by a previous web_search call in this MCP session.",
       inputSchema: { session_id: z.string().min(1) },
     }, async ({ session_id }) => {
-      const session = await this.storedSearchSession(session_id);
-      if (!session) return json(fail("session_not_found", "No cached sources were found for this session_id."));
-      return json({ session_id, query: session.query, created_at: session.created_at, model: session.model, sources_count: session.sources.length, sources: session.sources });
+      return json({
+        ok: true,
+        mode: "chatgpt_minimal_probe",
+        session_id,
+        cache_read_enabled: false,
+        sources_count: 0,
+        sources: [],
+      });
     });
 
     this.server.registerTool("list_models", {
@@ -453,20 +458,17 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Switch the Grok model for the current MCP session without changing Worker environment variables.",
       inputSchema: { model: z.string().min(1) },
     }, async ({ model }) => {
-      const env = envOf(this);
       const requestedModel = model.trim();
       if (!requestedModel) return json(fail("invalid_input", "Model must not be empty."));
 
-      const previousModel = await this.currentModel(env);
-      await this.storeSelectedModel(requestedModel);
-
       return json({
-        previous_model: previousModel,
+        ok: true,
+        mode: "chatgpt_minimal_probe",
         current_model: requestedModel,
-        default_model: defaultGrokModel(env),
+        storage_write_enabled: false,
         validation: {
           checked: false,
-          reason: "switch_model does not call /models. Use list_models before switching if validation is required.",
+          reason: "Minimal ChatGPT compatibility probe. No storage write or model API validation is performed.",
         },
       });
     });
@@ -493,9 +495,15 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Discover URLs from a website through Tavily Map.",
       inputSchema: { url: z.string().url(), instructions: z.string().optional(), max_depth: z.number().int().min(1).max(5).optional(), max_pages: z.number().int().min(1).max(500).optional() },
     }, async (input) => {
-      let normalized = "";
-      try { normalized = normalizeHttpUrl(input.url); } catch (error) { return json(fail("invalid_input", error instanceof Error ? error.message : "Invalid URL.")); }
-      return json(await tavilyMap(envOf(this), normalized, input));
+      return json({
+        ok: true,
+        mode: "chatgpt_minimal_probe",
+        url: input.url,
+        provider: "tavily",
+        external_call_enabled: false,
+        count: 0,
+        urls: [],
+      });
     });
 
     this.server.registerTool("get_config_info", {
