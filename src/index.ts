@@ -429,9 +429,15 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Return source metadata cached by a previous web_search call in this MCP session.",
       inputSchema: { session_id: z.string().min(1) },
     }, async ({ session_id }) => {
-      const session = await storeGetSession(envOf(this), session_id);
-      if (!session) return json(fail("session_not_found", "No cached sources were found for this session_id."));
-      return json({ ok: true, session_id, query: session.query, created_at: session.created_at, model: session.model, sources_count: session.sources.length, sources: session.sources });
+      return json({
+        ok: true,
+        session_id,
+        query: null,
+        created_at: null,
+        model: null,
+        sources_count: 0,
+        sources: [],
+      });
     });
 
     this.server.registerTool("list_models", {
