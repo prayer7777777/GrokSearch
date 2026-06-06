@@ -17,6 +17,8 @@ ChatGPT / MCP client
 
 Cloudflare's `McpAgent.serve('/mcp')` handles Streamable HTTP transport. The Worker exposes `/health` for a normal HTTP health check and `/mcp` for MCP clients.
 
+`McpAgent` creates a Durable Object-backed instance for each Streamable HTTP MCP session. This Worker stores the selected model and recent `web_search` sessions explicitly in that Durable Object storage, so `get_sources(session_id)` can read cached sources reliably within the same MCP session even after hibernation or Worker isolate restart. The cache is bounded to the most recent 50 search sessions per MCP session.
+
 ## Tools
 
 | Tool | Purpose |
@@ -55,7 +57,9 @@ Use `switch_model` to change the model for the current MCP session:
 }
 ```
 
-`switch_model` is intentionally a local session state update. It does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model. Use `list_models` before `switch_model` when validation is required.
+`switch_model` is intentionally a Durable Object session state update. It does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model. Use `list_models` before `switch_model` when validation is required.
+
+Search result source URLs are normalized, deduplicated, and stripped of common Markdown/citation tails before being stored.
 
 ## Local setup
 
@@ -137,7 +141,7 @@ If `MCP_SHARED_TOKEN` is enabled, configure the client-side authorization mechan
 4. `list_models` should return the model list from the configured Grok-compatible API.
 5. `switch_model` should update the current MCP session model without calling the models API.
 6. `web_search` should return `answer`, `session_id`, `sources_count`, and the model used.
-7. `get_sources` should return the cached source list from the same MCP session.
+7. `get_sources` should return the cached source list from the same MCP session, including after the Durable Object hibernates and resumes.
 8. `web_fetch` should return page content when Tavily or Firecrawl is configured.
 9. `web_map` should return discovered URLs when Tavily is configured.
 

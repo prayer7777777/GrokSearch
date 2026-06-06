@@ -1,6 +1,7 @@
 import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { cleanUrlCandidate, normalizeHttpUrl, sourcesFromText, type Source } from "./source-utils";
 
 export interface Env extends Cloudflare.Env {
   GROK_API_KEY?: string;
@@ -14,15 +15,6 @@ export interface Env extends Cloudflare.Env {
   MAX_TOOL_RESULT_CHARS?: string;
   MAX_SOURCES?: string;
 }
-
-type Source = {
-  id: string;
-  title?: string;
-  url: string;
-  snippet?: string;
-  provider: "grok" | "tavily" | "firecrawl";
-  retrieved_at: string;
-};
 
 type SearchSession = {
   query: string;
@@ -55,6 +47,10 @@ const SERVER_NAME = "grok-search-cloudflare-mcp";
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_GROK_MODEL = "grok-4-fast";
 const DEFAULT_STATE: AgentState = { sessions: {} };
+const SELECTED_MODEL_KEY = "app:selected_model";
+const SESSION_INDEX_KEY = "app:session_index";
+const SESSION_KEY_PREFIX = "app:session:";
+const MAX_STORED_SESSIONS = 50;
 
 function envOf(agent: unknown): Env {
   return (agent as { env: Env }).env;
@@ -83,13 +79,6 @@ function now() {
 
 function sessionId() {
   return `search_${Date.now().toString(36)}_${crypto.randomUUID().slice(0, 8)}`;
-}
-
-function normalizeHttpUrl(input: string) {
-  const url = new URL(input);
-  if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Only http and https URLs are supported.");
-  url.hash = "";
-  return url.toString();
 }
 
 function truncate(text: string, limit: number) {
@@ -232,7 +221,7 @@ function sourcesFrom(value: unknown, provider: Source["provider"], limit: number
     const rawUrl = o.url || o.uri || o.href;
     if (typeof rawUrl === "string") {
       try {
-        const url = normalizeHttpUrl(rawUrl);
+        const url = normalizeHttpUrl(cleanUrlCandidate(rawUrl));
         if (!seen.has(url)) {
           seen.add(url);
           out.push({
@@ -249,26 +238,6 @@ function sourcesFrom(value: unknown, provider: Source["provider"], limit: number
     for (const key of ["citations", "annotations", "references", "sources", "results", "search_results"]) visit(o[key]);
   };
   visit(value);
-  return out;
-}
-
-function sourcesFromText(text: string, provider: Source["provider"], limit: number): Source[] {
-  const seen = new Set<string>();
-  const out: Source[] = [];
-  const markdownLink = /\[[^\]]+\]\((https?:\/\/[^)\s]+)\)/g;
-  const bareUrl = /https?:\/\/[^\s)\]]+/g;
-  for (const pattern of [markdownLink, bareUrl]) {
-    let match: RegExpExecArray | null;
-    while ((match = pattern.exec(text)) && out.length < limit) {
-      const rawUrl = match[1] || match[0];
-      try {
-        const url = normalizeHttpUrl(rawUrl);
-        if (seen.has(url)) continue;
-        seen.add(url);
-        out.push({ id: crypto.randomUUID(), url, provider, retrieved_at: now() });
-      } catch {}
-    }
-  }
   return out;
 }
 
@@ -309,7 +278,7 @@ async function callGrok(env: Env, model: string, query: string, opts: { max_sour
   if (!response.ok) return fail("provider_error", `Grok API returned HTTP ${response.status}.`, { provider: "grok", status: response.status, retryable: response.status === 429 || response.status >= 500 });
   const answer = textFrom(response.data).trim() || "No textual answer was returned.";
   const structuredSources = sourcesFrom(response.data, "grok", maxSources);
-  const textSources = sourcesFromText(answer, "grok", Math.max(maxSources - structuredSources.length, 0));
+  const textSources = sourcesFromText(answer, "grok", Math.max(maxSources - structuredSources.length, 0), now);
   let sources = [...structuredSources, ...textSources];
   if (!sources.length && env.TAVILY_API_KEY) sources = await tavilySearchSources(env, query, maxSources);
   return { answer, sources, model };
@@ -378,6 +347,42 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
   initialState: AgentState = DEFAULT_STATE;
   server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
+  private async selectedModel() {
+    return this.ctx.storage.get<string>(SELECTED_MODEL_KEY);
+  }
+
+  private async currentModel(env: Env) {
+    return (await this.selectedModel()) || this.state?.selected_model || defaultGrokModel(env);
+  }
+
+  private async storeSelectedModel(model: string) {
+    await this.ctx.storage.put(SELECTED_MODEL_KEY, model);
+    this.setState({
+      ...(this.state || DEFAULT_STATE),
+      sessions: { ...(this.state?.sessions || {}) },
+      selected_model: model,
+    });
+  }
+
+  private async storeSearchSession(id: string, session: SearchSession) {
+    await this.ctx.storage.put(`${SESSION_KEY_PREFIX}${id}`, session);
+    const existing = (await this.ctx.storage.get<string[]>(SESSION_INDEX_KEY)) || [];
+    const next = [id, ...existing.filter((item) => item !== id)].slice(0, MAX_STORED_SESSIONS);
+    await this.ctx.storage.put(SESSION_INDEX_KEY, next);
+    for (const evicted of existing.filter((item) => !next.includes(item))) {
+      await this.ctx.storage.delete(`${SESSION_KEY_PREFIX}${evicted}`);
+    }
+    this.setState({
+      ...(this.state || DEFAULT_STATE),
+      selected_model: (await this.selectedModel()) || this.state?.selected_model,
+      sessions: { ...(this.state?.sessions || {}), [id]: session },
+    });
+  }
+
+  private async storedSearchSession(id: string) {
+    return (await this.ctx.storage.get<SearchSession>(`${SESSION_KEY_PREFIX}${id}`)) || this.state?.sessions?.[id];
+  }
+
   async init() {
     this.server.registerTool("web_search", {
       title: "Grok web search",
@@ -385,11 +390,11 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       inputSchema: { query: z.string().min(1), max_sources: z.number().int().min(1).max(50).optional(), allowed_domains: z.array(z.string()).optional(), excluded_domains: z.array(z.string()).optional(), include_images: z.boolean().optional() },
     }, async (input) => {
       const env = envOf(this);
-      const model = currentGrokModel(env, this.state);
+      const model = await this.currentModel(env);
       const result = await callGrok(env, model, input.query, input);
       if ("error" in result) return json(result);
       const id = sessionId();
-      this.setState({ ...(this.state || DEFAULT_STATE), sessions: { ...(this.state?.sessions || {}), [id]: { query: input.query, answer_preview: result.answer.slice(0, 500), sources: result.sources, created_at: now(), model: result.model } } });
+      await this.storeSearchSession(id, { query: input.query, answer_preview: result.answer.slice(0, 500), sources: result.sources, created_at: now(), model: result.model });
       return json({ session_id: id, answer: result.answer, sources_count: result.sources.length, sources_preview: result.sources.slice(0, 5), model: result.model });
     });
 
@@ -398,7 +403,7 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Return source metadata cached by a previous web_search call in this MCP session.",
       inputSchema: { session_id: z.string().min(1) },
     }, async ({ session_id }) => {
-      const session = this.state?.sessions?.[session_id];
+      const session = await this.storedSearchSession(session_id);
       if (!session) return json(fail("session_not_found", "No cached sources were found for this session_id."));
       return json({ session_id, query: session.query, created_at: session.created_at, model: session.model, sources_count: session.sources.length, sources: session.sources });
     });
@@ -411,11 +416,12 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       const env = envOf(this);
       const result = await listGrokModels(env);
       if ("error" in result) return json(result);
+      const selected = await this.selectedModel();
       return json({
         ...result,
         default_model: defaultGrokModel(env),
-        selected_model: this.state?.selected_model || null,
-        current_model: currentGrokModel(env, this.state),
+        selected_model: selected || this.state?.selected_model || null,
+        current_model: await this.currentModel(env),
       });
     });
 
@@ -428,13 +434,8 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       const requestedModel = model.trim();
       if (!requestedModel) return json(fail("invalid_input", "Model must not be empty."));
 
-      const previousModel = currentGrokModel(env, this.state);
-      const nextState: AgentState = {
-        ...(this.state || DEFAULT_STATE),
-        sessions: { ...(this.state?.sessions || {}) },
-        selected_model: requestedModel,
-      };
-      this.setState(nextState);
+      const previousModel = await this.currentModel(env);
+      await this.storeSelectedModel(requestedModel);
 
       return json({
         previous_model: previousModel,
@@ -480,6 +481,7 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       inputSchema: {},
     }, async () => {
       const env = envOf(this);
+      const selected = await this.selectedModel();
       return json({
         server: SERVER_NAME,
         version: SERVER_VERSION,
@@ -487,8 +489,8 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
           configured: Boolean(env.GROK_API_KEY),
           api_url: grokBaseUrl(env),
           default_model: defaultGrokModel(env),
-          selected_model: this.state?.selected_model || null,
-          current_model: currentGrokModel(env, this.state),
+          selected_model: selected || this.state?.selected_model || null,
+          current_model: await this.currentModel(env),
         },
         tavily: { configured: Boolean(env.TAVILY_API_KEY), api_url: env.TAVILY_API_URL || "https://api.tavily.com" },
         firecrawl: { configured: Boolean(env.FIRECRAWL_API_KEY), api_url: env.FIRECRAWL_API_URL || "https://api.firecrawl.dev/v2" },
