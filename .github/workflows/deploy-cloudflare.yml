@@ -26,14 +26,18 @@ jobs:
           cache: npm
       - run: npm install
       - run: npm run typecheck
-      - name: Deploy Worker
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+      - name: Check Cloudflare deploy secrets
         env:
-          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
-          MCP_SHARED_TOKEN: ${{ secrets.MCP_SHARED_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || (echo "::error::CLOUDFLARE_API_TOKEN is not set" && exit 1)
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || (echo "::error::CLOUDFLARE_ACCOUNT_ID is not set" && exit 1)
+          echo "Cloudflare deploy secrets are present."
+      - name: Show Wrangler version
+        run: npx wrangler --version
+      - name: Deploy Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy --config wrangler.jsonc
