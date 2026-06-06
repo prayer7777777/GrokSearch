@@ -7,7 +7,7 @@
   "observability": { "enabled": true },
   "vars": {
     "GROK_API_URL": "https://jiuuij.de5.net/v1",
-    "GROK_MODEL": "grok-4.3-medium",
+    "GROK_MODEL": "grok-4.20-multi-agent-xhigh",
     "TAVILY_API_URL": "https://api.tavily.com",
     "FIRECRAWL_API_URL": "https://api.firecrawl.dev/v2",
     "MAX_TOOL_RESULT_CHARS": "30000",
