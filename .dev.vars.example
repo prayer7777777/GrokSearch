@@ -1,0 +1,12 @@
+GROK_API_KEY="xai-your-key"
+GROK_API_URL="https://api.x.ai/v1"
+GROK_MODEL="grok-4-fast"
+
+TAVILY_API_KEY="tvly-your-key"
+TAVILY_API_URL="https://api.tavily.com"
+
+FIRECRAWL_API_KEY="fc-your-key"
+FIRECRAWL_API_URL="https://api.firecrawl.dev/v2"
+
+# Optional. If set, all /mcp requests must use Authorization: Bearer <token>.
+MCP_SHARED_TOKEN=""
