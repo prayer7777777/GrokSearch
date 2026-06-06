@@ -4,6 +4,7 @@ import { z } from "zod";
 import { cleanUrlCandidate, normalizeHttpUrl, sourcesFromText, type Source } from "./source-utils";
 
 export interface Env extends Cloudflare.Env {
+  SEARCH_CACHE: DurableObjectNamespace;
   GROK_API_KEY?: string;
   GROK_API_URL?: string;
   GROK_MODEL?: string;
@@ -51,6 +52,8 @@ const SELECTED_MODEL_KEY = "app:selected_model";
 const SESSION_INDEX_KEY = "app:session_index";
 const SESSION_KEY_PREFIX = "app:session:";
 const MAX_STORED_SESSIONS = 50;
+const GLOBAL_MAX_STORED_SESSIONS = 500;
+const searchSessions = new Map<string, SearchSession>();
 
 function envOf(agent: unknown): Env {
   return (agent as { env: Env }).env;
@@ -112,8 +115,30 @@ function defaultGrokModel(env: Env) {
   return env.GROK_MODEL || DEFAULT_GROK_MODEL;
 }
 
-function currentGrokModel(env: Env, state?: AgentState) {
-  return state?.selected_model || defaultGrokModel(env);
+function rememberSearchSession(id: string, session: SearchSession) {
+  searchSessions.set(id, session);
+  if (searchSessions.size <= GLOBAL_MAX_STORED_SESSIONS) return;
+  const oldest = searchSessions.keys().next().value;
+  if (oldest) searchSessions.delete(oldest);
+}
+
+async function globalSearchCache(env: Env, id: string, session?: SearchSession) {
+  if (!env.SEARCH_CACHE) return undefined;
+  try {
+    const cacheId = env.SEARCH_CACHE.idFromName("global-search-sessions");
+    const stub = env.SEARCH_CACHE.get(cacheId);
+    const request = new Request(`https://search-cache.local/session/${encodeURIComponent(id)}`, {
+      method: session ? "PUT" : "GET",
+      headers: { "Content-Type": "application/json" },
+      body: session ? JSON.stringify(session) : undefined,
+    });
+    const response = await stub.fetch(request);
+    if (session) return response.ok ? session : undefined;
+    if (!response.ok) return undefined;
+    return await response.json<SearchSession>();
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeGrokModels(value: unknown): GrokModelInfo[] {
@@ -326,16 +351,19 @@ async function firecrawlScrape(env: Env, url: string, format: "markdown" | "text
 
 async function tavilyMap(env: Env, url: string, input: { instructions?: string; max_depth?: number; max_pages?: number }) {
   if (!env.TAVILY_API_KEY) return fail("missing_config", "TAVILY_API_KEY is required for web_map.", { provider: "tavily" });
-  const limit = Math.min(Math.max(input.max_pages || 50, 1), 500);
+  const limit = Math.min(Math.max(input.max_pages || 20, 1), 100);
   const response = await fetchJson(`${trimSlash(env.TAVILY_API_URL || "https://api.tavily.com")}/map`, {
     method: "POST",
     headers: { Authorization: `Bearer ${env.TAVILY_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({ url, instructions: input.instructions || undefined, max_depth: Math.min(Math.max(input.max_depth || 1, 1), 5), limit }),
-  }, 45000);
+  }, 25000);
   if (!response.ok) return fail("provider_error", `Tavily Map returned HTTP ${response.status}.`, { provider: "tavily", status: response.status, retryable: response.status === 429 || response.status >= 500 });
   const data = rec(response.data);
-  const urls = (Array.isArray(data.results) ? data.results : []).filter((item): item is string => typeof item === "string").slice(0, limit);
-  return { base_url: typeof data.base_url === "string" ? data.base_url : url, urls, count: urls.length, provider: "tavily" };
+  const urls = (Array.isArray(data.results) ? data.results : [])
+    .filter((item): item is string => typeof item === "string")
+    .map(cleanUrlCandidate)
+    .slice(0, limit);
+  return { base_url: typeof data.base_url === "string" ? data.base_url : url, urls, count: urls.length, requested_limit: limit, provider: "tavily" };
 }
 
 function isAuthorized(request: Request, env: Env) {
@@ -352,19 +380,17 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
   }
 
   private async currentModel(env: Env) {
-    return (await this.selectedModel()) || this.state?.selected_model || defaultGrokModel(env);
+    return (await this.selectedModel()) || defaultGrokModel(env);
   }
 
   private async storeSelectedModel(model: string) {
     await this.ctx.storage.put(SELECTED_MODEL_KEY, model);
-    this.setState({
-      ...(this.state || DEFAULT_STATE),
-      sessions: { ...(this.state?.sessions || {}) },
-      selected_model: model,
-    });
   }
 
   private async storeSearchSession(id: string, session: SearchSession) {
+    const env = envOf(this);
+    rememberSearchSession(id, session);
+    await globalSearchCache(env, id, session);
     await this.ctx.storage.put(`${SESSION_KEY_PREFIX}${id}`, session);
     const existing = (await this.ctx.storage.get<string[]>(SESSION_INDEX_KEY)) || [];
     const next = [id, ...existing.filter((item) => item !== id)].slice(0, MAX_STORED_SESSIONS);
@@ -372,15 +398,12 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
     for (const evicted of existing.filter((item) => !next.includes(item))) {
       await this.ctx.storage.delete(`${SESSION_KEY_PREFIX}${evicted}`);
     }
-    this.setState({
-      ...(this.state || DEFAULT_STATE),
-      selected_model: (await this.selectedModel()) || this.state?.selected_model,
-      sessions: { ...(this.state?.sessions || {}), [id]: session },
-    });
   }
 
   private async storedSearchSession(id: string) {
-    return (await this.ctx.storage.get<SearchSession>(`${SESSION_KEY_PREFIX}${id}`)) || this.state?.sessions?.[id];
+    return (await this.ctx.storage.get<SearchSession>(`${SESSION_KEY_PREFIX}${id}`))
+      || searchSessions.get(id)
+      || await globalSearchCache(envOf(this), id);
   }
 
   async init() {
@@ -420,7 +443,7 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       return json({
         ...result,
         default_model: defaultGrokModel(env),
-        selected_model: selected || this.state?.selected_model || null,
+        selected_model: selected || null,
         current_model: await this.currentModel(env),
       });
     });
@@ -489,7 +512,7 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
           configured: Boolean(env.GROK_API_KEY),
           api_url: grokBaseUrl(env),
           default_model: defaultGrokModel(env),
-          selected_model: selected || this.state?.selected_model || null,
+          selected_model: selected || null,
           current_model: await this.currentModel(env),
         },
         tavily: { configured: Boolean(env.TAVILY_API_KEY), api_url: env.TAVILY_API_URL || "https://api.tavily.com" },
@@ -498,6 +521,39 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
         tools: ["web_search", "get_sources", "list_models", "switch_model", "web_fetch", "web_map", "get_config_info"],
       });
     });
+  }
+}
+
+export class SearchCache {
+  constructor(private ctx: DurableObjectState, _env: Env) {}
+
+  async fetch(request: Request) {
+    const url = new URL(request.url);
+    const match = /^\/session\/([^/]+)$/.exec(url.pathname);
+    if (!match) return Response.json(fail("not_found", "Search cache route not found."), { status: 404 });
+
+    const id = decodeURIComponent(match[1]);
+    if (!id.startsWith("search_")) return Response.json(fail("invalid_input", "Invalid search session id."), { status: 400 });
+
+    if (request.method === "GET") {
+      const session = await this.ctx.storage.get<SearchSession>(`${SESSION_KEY_PREFIX}${id}`);
+      if (!session) return Response.json(fail("session_not_found", "No cached sources were found for this session_id."), { status: 404 });
+      return Response.json(session);
+    }
+
+    if (request.method === "PUT") {
+      const session = await request.json<SearchSession>();
+      await this.ctx.storage.put(`${SESSION_KEY_PREFIX}${id}`, session);
+      const existing = (await this.ctx.storage.get<string[]>(SESSION_INDEX_KEY)) || [];
+      const next = [id, ...existing.filter((item) => item !== id)].slice(0, GLOBAL_MAX_STORED_SESSIONS);
+      await this.ctx.storage.put(SESSION_INDEX_KEY, next);
+      for (const evicted of existing.filter((item) => !next.includes(item))) {
+        await this.ctx.storage.delete(`${SESSION_KEY_PREFIX}${evicted}`);
+      }
+      return Response.json({ ok: true });
+    }
+
+    return Response.json(fail("method_not_allowed", "Method not allowed."), { status: 405 });
   }
 }
 

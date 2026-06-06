@@ -15,10 +15,12 @@
   },
   "durable_objects": {
     "bindings": [
-      { "name": "MCP_OBJECT", "class_name": "GrokSearchMCP" }
+      { "name": "MCP_OBJECT", "class_name": "GrokSearchMCP" },
+      { "name": "SEARCH_CACHE", "class_name": "SearchCache" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["GrokSearchMCP"] }
+    { "tag": "v1", "new_sqlite_classes": ["GrokSearchMCP"] },
+    { "tag": "v2", "new_sqlite_classes": ["SearchCache"] }
   ]
 }
