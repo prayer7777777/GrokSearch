@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "grok-search-cloudflare-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "vars": {
+    "GROK_API_URL": "https://api.x.ai/v1",
+    "GROK_MODEL": "grok-4-fast",
+    "TAVILY_API_URL": "https://api.tavily.com",
+    "FIRECRAWL_API_URL": "https://api.firecrawl.dev/v2",
+    "MAX_TOOL_RESULT_CHARS": "30000",
+    "MAX_SOURCES": "20"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "MCP_OBJECT", "class_name": "GrokSearchMCP" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GrokSearchMCP"] }
+  ]
+}
