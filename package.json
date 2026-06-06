@@ -1,0 +1,25 @@
+{
+  "name": "grok-search-cloudflare-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare Workers native Remote MCP server for Grok Search, Tavily Extract/Map, and Firecrawl fallback.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 8788",
+    "start": "wrangler dev --port 8788",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "agents": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "latest",
+    "typescript": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}
