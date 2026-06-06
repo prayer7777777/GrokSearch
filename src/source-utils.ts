@@ -16,21 +16,18 @@ export function normalizeHttpUrl(input: string) {
 
 export function cleanUrlCandidate(input: string) {
   let value = input.trim();
-  for (const marker of ["**[[", "[[", "__[[", "`[[", "**", "__", "`"]) {
+  for (const marker of ["**[[", "[[", "**", "<", "\"", "'"]) {
     const index = value.indexOf(marker);
-    if (index >= 0) value = value.slice(0, index);
+    if (index > 0) value = value.slice(0, index);
   }
-  value = value.replace(/[>\]}"'`]+$/g, "");
-  value = value.replace(/[.,;:!?]+$/g, "");
-  while (value.endsWith(")") && !value.includes("(")) value = value.slice(0, -1);
-  return value;
+  return value.replace(/[)\]\}>,.;:*]+$/g, "");
 }
 
 export function sourcesFromText(text: string, provider: Source["provider"], limit: number, retrievedAt: () => string): Source[] {
   const seen = new Set<string>();
   const out: Source[] = [];
   const markdownLink = /\[[^\]]+\]\((https?:\/\/[^)\s<>"']+)\)/g;
-  const bareUrl = /https?:\/\/[^\s<>"'\]]+/g;
+  const bareUrl = /https?:\/\/[^\s)\]\}>"']+/g;
   for (const pattern of [markdownLink, bareUrl]) {
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(text)) && out.length < limit) {

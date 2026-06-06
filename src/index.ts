@@ -5,6 +5,7 @@ import { cleanUrlCandidate, normalizeHttpUrl, sourcesFromText, type Source } fro
 
 export interface Env extends Cloudflare.Env {
   SEARCH_CACHE: DurableObjectNamespace;
+  GROK_SEARCH_STORE: DurableObjectNamespace;
   GROK_API_KEY?: string;
   GROK_API_URL?: string;
   GROK_MODEL?: string;
@@ -18,6 +19,7 @@ export interface Env extends Cloudflare.Env {
 }
 
 type SearchSession = {
+  session_id: string;
   query: string;
   answer_preview: string;
   sources: Source[];
@@ -25,10 +27,7 @@ type SearchSession = {
   model?: string;
 };
 
-type AgentState = {
-  sessions: Record<string, SearchSession>;
-  selected_model?: string;
-};
+type AgentState = Record<string, never>;
 
 type FetchResult = {
   url: string;
@@ -47,11 +46,9 @@ type GrokModelInfo = {
 const SERVER_NAME = "grok-search-cloudflare-mcp";
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_GROK_MODEL = "grok-4-fast";
-const DEFAULT_STATE: AgentState = { sessions: {} };
 const SELECTED_MODEL_KEY = "app:selected_model";
 const SESSION_INDEX_KEY = "app:session_index";
 const SESSION_KEY_PREFIX = "app:session:";
-const MAX_STORED_SESSIONS = 50;
 const GLOBAL_MAX_STORED_SESSIONS = 500;
 const searchSessions = new Map<string, SearchSession>();
 
@@ -64,7 +61,7 @@ function json(value: unknown) {
 }
 
 function fail(code: string, message: string, extra: Record<string, unknown> = {}) {
-  return { error: { code, message, retryable: false, ...extra } };
+  return { ok: false, error: { code, message, retryable: false, ...extra } };
 }
 
 function trimSlash(value: string) {
@@ -115,6 +112,10 @@ function defaultGrokModel(env: Env) {
   return env.GROK_MODEL || DEFAULT_GROK_MODEL;
 }
 
+function currentGrokModel(env: Env, selectedModel?: string | null) {
+  return selectedModel || defaultGrokModel(env);
+}
+
 function rememberSearchSession(id: string, session: SearchSession) {
   searchSessions.set(id, session);
   if (searchSessions.size <= GLOBAL_MAX_STORED_SESSIONS) return;
@@ -122,23 +123,53 @@ function rememberSearchSession(id: string, session: SearchSession) {
   if (oldest) searchSessions.delete(oldest);
 }
 
-async function globalSearchCache(env: Env, id: string, session?: SearchSession) {
-  if (!env.SEARCH_CACHE) return undefined;
+async function storeRequest<T>(env: Env, path: string, init: RequestInit = {}) {
   try {
-    const cacheId = env.SEARCH_CACHE.idFromName("global-search-sessions");
-    const stub = env.SEARCH_CACHE.get(cacheId);
-    const request = new Request(`https://search-cache.local/session/${encodeURIComponent(id)}`, {
-      method: session ? "PUT" : "GET",
-      headers: { "Content-Type": "application/json" },
-      body: session ? JSON.stringify(session) : undefined,
-    });
+    const storeId = env.GROK_SEARCH_STORE.idFromName("global");
+    const stub = env.GROK_SEARCH_STORE.get(storeId);
+    const headers = new Headers(init.headers);
+    if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    const request = new Request(`https://grok-search-store.local${path}`, { ...init, headers });
     const response = await stub.fetch(request);
-    if (session) return response.ok ? session : undefined;
-    if (!response.ok) return undefined;
-    return await response.json<SearchSession>();
-  } catch {
-    return undefined;
+    const data = await response.json().catch(() => null) as T | null;
+    return { ok: response.ok, status: response.status, data };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 500,
+      data: fail("store_error", error instanceof Error ? error.message : "GrokSearchStore request failed.", { retryable: true }) as T,
+    };
   }
+}
+
+async function storeGetSelectedModel(env: Env) {
+  const result = await storeRequest<{ ok: boolean; selected_model: string | null }>(env, "/selected_model");
+  return result.ok && result.data ? result.data.selected_model : null;
+}
+
+async function storePutSelectedModel(env: Env, model: string) {
+  return storeRequest<{ ok: boolean; selected_model: string }>(env, "/selected_model", {
+    method: "PUT",
+    body: JSON.stringify({ model }),
+  });
+}
+
+async function storeDeleteSelectedModel(env: Env) {
+  return storeRequest<{ ok: boolean; selected_model: null }>(env, "/selected_model", { method: "DELETE" });
+}
+
+async function storeSaveSession(env: Env, session: SearchSession) {
+  rememberSearchSession(session.session_id, session);
+  return storeRequest<{ ok: boolean }>(env, `/sessions/${encodeURIComponent(session.session_id)}`, {
+    method: "PUT",
+    body: JSON.stringify(session),
+  });
+}
+
+async function storeGetSession(env: Env, id: string) {
+  const result = await storeRequest<SearchSession | ReturnType<typeof fail>>(env, `/sessions/${encodeURIComponent(id)}`);
+  if (result.ok && result.data && !("error" in result.data)) return result.data;
+  return searchSessions.get(id);
 }
 
 function normalizeGrokModels(value: unknown): GrokModelInfo[] {
@@ -351,7 +382,7 @@ async function firecrawlScrape(env: Env, url: string, format: "markdown" | "text
 
 async function tavilyMap(env: Env, url: string, input: { instructions?: string; max_depth?: number; max_pages?: number }) {
   if (!env.TAVILY_API_KEY) return fail("missing_config", "TAVILY_API_KEY is required for web_map.", { provider: "tavily" });
-  const limit = Math.min(Math.max(input.max_pages || 20, 1), 100);
+  const limit = Math.min(Math.max(input.max_pages || 50, 1), 500);
   const response = await fetchJson(`${trimSlash(env.TAVILY_API_URL || "https://api.tavily.com")}/map`, {
     method: "POST",
     headers: { Authorization: `Bearer ${env.TAVILY_API_KEY}`, "Content-Type": "application/json" },
@@ -372,39 +403,8 @@ function isAuthorized(request: Request, env: Env) {
 }
 
 export class GrokSearchMCP extends McpAgent<Env, AgentState> {
-  initialState: AgentState = DEFAULT_STATE;
+  initialState: AgentState = {};
   server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
-
-  private async selectedModel() {
-    return this.ctx.storage.get<string>(SELECTED_MODEL_KEY);
-  }
-
-  private async currentModel(env: Env) {
-    return (await this.selectedModel()) || defaultGrokModel(env);
-  }
-
-  private async storeSelectedModel(model: string) {
-    await this.ctx.storage.put(SELECTED_MODEL_KEY, model);
-  }
-
-  private async storeSearchSession(id: string, session: SearchSession) {
-    const env = envOf(this);
-    rememberSearchSession(id, session);
-    await globalSearchCache(env, id, session);
-    await this.ctx.storage.put(`${SESSION_KEY_PREFIX}${id}`, session);
-    const existing = (await this.ctx.storage.get<string[]>(SESSION_INDEX_KEY)) || [];
-    const next = [id, ...existing.filter((item) => item !== id)].slice(0, MAX_STORED_SESSIONS);
-    await this.ctx.storage.put(SESSION_INDEX_KEY, next);
-    for (const evicted of existing.filter((item) => !next.includes(item))) {
-      await this.ctx.storage.delete(`${SESSION_KEY_PREFIX}${evicted}`);
-    }
-  }
-
-  private async storedSearchSession(id: string) {
-    return (await this.ctx.storage.get<SearchSession>(`${SESSION_KEY_PREFIX}${id}`))
-      || searchSessions.get(id)
-      || await globalSearchCache(envOf(this), id);
-  }
 
   async init() {
     this.server.registerTool("web_search", {
@@ -413,12 +413,15 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       inputSchema: { query: z.string().min(1), max_sources: z.number().int().min(1).max(50).optional(), allowed_domains: z.array(z.string()).optional(), excluded_domains: z.array(z.string()).optional(), include_images: z.boolean().optional() },
     }, async (input) => {
       const env = envOf(this);
-      const model = await this.currentModel(env);
+      const selectedModel = await storeGetSelectedModel(env);
+      const model = currentGrokModel(env, selectedModel);
       const result = await callGrok(env, model, input.query, input);
       if ("error" in result) return json(result);
       const id = sessionId();
-      await this.storeSearchSession(id, { query: input.query, answer_preview: result.answer.slice(0, 500), sources: result.sources, created_at: now(), model: result.model });
-      return json({ session_id: id, answer: result.answer, sources_count: result.sources.length, sources_preview: result.sources.slice(0, 5), model: result.model });
+      const session = { session_id: id, query: input.query, answer_preview: result.answer.slice(0, 500), sources: result.sources, created_at: now(), model: result.model };
+      const stored = await storeSaveSession(env, session);
+      if (!stored.ok) return json(fail("store_error", "Search completed, but the session cache could not be saved.", { retryable: true, details: stored.data }));
+      return json({ ok: true, session_id: id, answer: result.answer, sources_count: result.sources.length, sources_preview: result.sources.slice(0, 5), model: result.model });
     });
 
     this.server.registerTool("get_sources", {
@@ -426,14 +429,9 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Return source metadata cached by a previous web_search call in this MCP session.",
       inputSchema: { session_id: z.string().min(1) },
     }, async ({ session_id }) => {
-      return json({
-        ok: true,
-        mode: "chatgpt_minimal_probe",
-        session_id,
-        cache_read_enabled: false,
-        sources_count: 0,
-        sources: [],
-      });
+      const session = await storeGetSession(envOf(this), session_id);
+      if (!session) return json(fail("session_not_found", "No cached sources were found for this session_id."));
+      return json({ ok: true, session_id, query: session.query, created_at: session.created_at, model: session.model, sources_count: session.sources.length, sources: session.sources });
     });
 
     this.server.registerTool("list_models", {
@@ -444,12 +442,13 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       const env = envOf(this);
       const result = await listGrokModels(env);
       if ("error" in result) return json(result);
-      const selected = await this.selectedModel();
+      const selected = await storeGetSelectedModel(env);
       return json({
+        ok: true,
         ...result,
         default_model: defaultGrokModel(env),
         selected_model: selected || null,
-        current_model: await this.currentModel(env),
+        current_model: currentGrokModel(env, selected),
       });
     });
 
@@ -458,17 +457,27 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Switch the Grok model for the current MCP session without changing Worker environment variables.",
       inputSchema: { model: z.string().min(1) },
     }, async ({ model }) => {
+      const env = envOf(this);
       const requestedModel = model.trim();
       if (!requestedModel) return json(fail("invalid_input", "Model must not be empty."));
+      const previousSelected = await storeGetSelectedModel(env);
+      const previousModel = currentGrokModel(env, previousSelected);
+      const defaultModel = defaultGrokModel(env);
+      const stored = requestedModel === defaultModel
+        ? await storeDeleteSelectedModel(env)
+        : await storePutSelectedModel(env, requestedModel);
+      if (!stored.ok) return json(fail("store_error", "The selected model could not be saved.", { retryable: true, details: stored.data }));
+      const confirmedModel = await storeGetSelectedModel(env);
 
       return json({
         ok: true,
-        mode: "chatgpt_minimal_probe",
-        current_model: requestedModel,
-        storage_write_enabled: false,
+        previous_model: previousModel,
+        current_model: currentGrokModel(env, confirmedModel),
+        default_model: defaultModel,
+        persistence: "durable_object_store",
         validation: {
           checked: false,
-          reason: "Minimal ChatGPT compatibility probe. No storage write or model API validation is performed.",
+          reason: "Use list_models before switch_model if validation is required.",
         },
       });
     });
@@ -482,12 +491,16 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       let normalized = "";
       try { normalized = normalizeHttpUrl(url); } catch (error) { return json(fail("invalid_input", error instanceof Error ? error.message : "Invalid URL.")); }
       if (!env.TAVILY_API_KEY && !env.FIRECRAWL_API_KEY) return json(fail("missing_config", "Configure TAVILY_API_KEY or FIRECRAWL_API_KEY to use web_fetch."));
-      let fetched: FetchResult | ReturnType<typeof fail> | null = await tavilyExtract(env, normalized, format);
-      if (!fetched) fetched = await firecrawlScrape(env, normalized, format);
-      if (!fetched) return json(fail("empty_content", "The page could not be fetched or returned empty content.", { retryable: true }));
-      if ("error" in fetched) return json(fetched);
-      const output = truncate(fetched.content, max_chars || maxNumber(env.MAX_TOOL_RESULT_CHARS, 30000, 1000, 100000));
-      return json({ url: fetched.url, title: fetched.title, content: output.text, provider: fetched.provider, truncated: output.truncated, char_count: fetched.content.length });
+      try {
+        let fetched: FetchResult | ReturnType<typeof fail> | null = await tavilyExtract(env, normalized, format);
+        if (!fetched) fetched = await firecrawlScrape(env, normalized, format);
+        if (!fetched) return json(fail("empty_content", "The page could not be fetched or returned empty content.", { retryable: true }));
+        if ("error" in fetched) return json(fetched);
+        const output = truncate(fetched.content, max_chars || maxNumber(env.MAX_TOOL_RESULT_CHARS, 30000, 1000, 100000));
+        return json({ ok: true, url: fetched.url, title: fetched.title, content: output.text, provider: fetched.provider, truncated: output.truncated, char_count: fetched.content.length });
+      } catch (error) {
+        return json(fail("provider_error", error instanceof Error ? error.message : "The page fetch failed.", { retryable: true }));
+      }
     });
 
     this.server.registerTool("web_map", {
@@ -495,15 +508,15 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       description: "Discover URLs from a website through Tavily Map.",
       inputSchema: { url: z.string().url(), instructions: z.string().optional(), max_depth: z.number().int().min(1).max(5).optional(), max_pages: z.number().int().min(1).max(500).optional() },
     }, async (input) => {
-      return json({
-        ok: true,
-        mode: "chatgpt_minimal_probe",
-        url: input.url,
-        provider: "tavily",
-        external_call_enabled: false,
-        count: 0,
-        urls: [],
-      });
+      let normalized = "";
+      try { normalized = normalizeHttpUrl(input.url); } catch (error) { return json(fail("invalid_input", error instanceof Error ? error.message : "Invalid URL.")); }
+      try {
+        const result = await tavilyMap(envOf(this), normalized, input);
+        if ("error" in result) return json(result);
+        return json({ ok: true, ...result, note: result.count === 0 ? "Provider returned no URLs." : undefined });
+      } catch (error) {
+        return json(fail("provider_error", error instanceof Error ? error.message : "Tavily Map failed.", { provider: "tavily", retryable: true }));
+      }
     });
 
     this.server.registerTool("get_config_info", {
@@ -512,8 +525,9 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
       inputSchema: {},
     }, async () => {
       const env = envOf(this);
-      const selected = await this.selectedModel();
+      const selected = await storeGetSelectedModel(env);
       return json({
+        ok: true,
         server: SERVER_NAME,
         version: SERVER_VERSION,
         grok: {
@@ -521,7 +535,7 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
           api_url: grokBaseUrl(env),
           default_model: defaultGrokModel(env),
           selected_model: selected || null,
-          current_model: await this.currentModel(env),
+          current_model: currentGrokModel(env, selected),
         },
         tavily: { configured: Boolean(env.TAVILY_API_KEY), api_url: env.TAVILY_API_URL || "https://api.tavily.com" },
         firecrawl: { configured: Boolean(env.FIRECRAWL_API_KEY), api_url: env.FIRECRAWL_API_URL || "https://api.firecrawl.dev/v2" },
@@ -529,6 +543,164 @@ export class GrokSearchMCP extends McpAgent<Env, AgentState> {
         tools: ["web_search", "get_sources", "list_models", "switch_model", "web_fetch", "web_map", "get_config_info"],
       });
     });
+  }
+}
+
+export class GrokSearchStore {
+  constructor(private ctx: DurableObjectState, _env: Env) {}
+
+  private ensureTables() {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS kv (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )
+    `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS search_sessions (
+        session_id TEXT PRIMARY KEY,
+        query TEXT NOT NULL,
+        answer_preview TEXT NOT NULL,
+        model TEXT,
+        sources_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `);
+  }
+
+  private selectedModel() {
+    this.ensureTables();
+    const rows = this.ctx.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", SELECTED_MODEL_KEY).toArray();
+    return rows[0]?.value || null;
+  }
+
+  private saveSelectedModel(model: string) {
+    this.ensureTables();
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?, ?, ?)",
+      SELECTED_MODEL_KEY,
+      model,
+      now(),
+    );
+  }
+
+  private deleteSelectedModel() {
+    this.ensureTables();
+    this.ctx.storage.sql.exec("DELETE FROM kv WHERE key = ?", SELECTED_MODEL_KEY);
+  }
+
+  private saveSession(session: SearchSession) {
+    this.ensureTables();
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO search_sessions (session_id, query, answer_preview, model, sources_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      session.session_id,
+      session.query,
+      session.answer_preview,
+      session.model || null,
+      JSON.stringify(session.sources),
+      session.created_at,
+    );
+    this.cleanupSessions();
+  }
+
+  private getSession(sessionId: string): SearchSession | null {
+    this.ensureTables();
+    const rows = this.ctx.storage.sql.exec<{
+      session_id: string;
+      query: string;
+      answer_preview: string;
+      model: string | null;
+      sources_json: string;
+      created_at: string;
+    }>(
+      "SELECT session_id, query, answer_preview, model, sources_json, created_at FROM search_sessions WHERE session_id = ?",
+      sessionId,
+    ).toArray();
+    const row = rows[0];
+    if (!row) return null;
+    let sources: Source[] = [];
+    try {
+      const parsed = JSON.parse(row.sources_json);
+      sources = Array.isArray(parsed) ? parsed : [];
+    } catch {}
+    return {
+      session_id: row.session_id,
+      query: row.query,
+      answer_preview: row.answer_preview,
+      model: row.model || undefined,
+      sources,
+      created_at: row.created_at,
+    };
+  }
+
+  private cleanupSessions() {
+    this.ensureTables();
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    this.ctx.storage.sql.exec("DELETE FROM search_sessions WHERE created_at < ?", cutoff);
+    this.ctx.storage.sql.exec(`
+      DELETE FROM search_sessions
+      WHERE session_id NOT IN (
+        SELECT session_id FROM search_sessions
+        ORDER BY created_at DESC
+        LIMIT ?
+      )
+    `, GLOBAL_MAX_STORED_SESSIONS);
+  }
+
+  async fetch(request: Request) {
+    const url = new URL(request.url);
+    try {
+      if (url.pathname === "/selected_model") {
+        if (request.method === "GET") return Response.json({ ok: true, selected_model: this.selectedModel() });
+        if (request.method === "PUT") {
+          const body = rec(await request.json().catch(() => null));
+          const model = typeof body.model === "string" ? body.model.trim() : "";
+          if (!model) return Response.json(fail("invalid_input", "Model must not be empty."), { status: 400 });
+          this.saveSelectedModel(model);
+          return Response.json({ ok: true, selected_model: this.selectedModel() });
+        }
+        if (request.method === "DELETE") {
+          this.deleteSelectedModel();
+          return Response.json({ ok: true, selected_model: null });
+        }
+      }
+
+      const sessionMatch = /^\/sessions\/([^/]+)$/.exec(url.pathname);
+      if (sessionMatch) {
+        const sessionId = decodeURIComponent(sessionMatch[1]);
+        if (!sessionId.startsWith("search_")) return Response.json(fail("invalid_input", "Invalid search session id."), { status: 400 });
+        if (request.method === "GET") {
+          const session = this.getSession(sessionId);
+          if (!session) return Response.json(fail("session_not_found", "No cached sources were found for this session_id."), { status: 404 });
+          return Response.json({ ok: true, ...session });
+        }
+        if (request.method === "PUT") {
+          const body = rec(await request.json().catch(() => null));
+          const sources = Array.isArray(body.sources) ? body.sources as Source[] : [];
+          const session: SearchSession = {
+            session_id: sessionId,
+            query: typeof body.query === "string" ? body.query : "",
+            answer_preview: typeof body.answer_preview === "string" ? body.answer_preview : "",
+            model: typeof body.model === "string" ? body.model : undefined,
+            sources,
+            created_at: typeof body.created_at === "string" ? body.created_at : now(),
+          };
+          if (!session.query) return Response.json(fail("invalid_input", "Session query must not be empty."), { status: 400 });
+          this.saveSession(session);
+          return Response.json({ ok: true, session_id: sessionId });
+        }
+      }
+
+      if (url.pathname === "/cleanup" && request.method === "POST") {
+        this.cleanupSessions();
+        return Response.json({ ok: true });
+      }
+
+      return Response.json(fail("not_found", "GrokSearchStore route not found."), { status: 404 });
+    } catch (error) {
+      return Response.json(fail("store_error", error instanceof Error ? error.message : "GrokSearchStore failed.", { retryable: true }), { status: 500 });
+    }
   }
 }
 
@@ -546,7 +718,7 @@ export class SearchCache {
     if (request.method === "GET") {
       const session = await this.ctx.storage.get<SearchSession>(`${SESSION_KEY_PREFIX}${id}`);
       if (!session) return Response.json(fail("session_not_found", "No cached sources were found for this session_id."), { status: 404 });
-      return Response.json(session);
+      return Response.json({ ok: true, ...session });
     }
 
     if (request.method === "PUT") {

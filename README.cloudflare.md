@@ -13,11 +13,14 @@ ChatGPT / MCP client
   -> Grok/xAI web search
   -> Tavily Extract / Map
   -> Firecrawl Scrape fallback
+  -> GrokSearchStore Durable Object
 ```
 
 Cloudflare's `McpAgent.serve('/mcp')` handles Streamable HTTP transport. The Worker exposes `/health` for a normal HTTP health check and `/mcp` for MCP clients.
 
-`McpAgent` creates a Durable Object-backed instance for each Streamable HTTP MCP session. This Worker stores the selected model in that session Durable Object, and stores recent `web_search` sessions in a separate named `SearchCache` Durable Object. That makes `get_sources(session_id)` work even when a client such as ChatGPT refreshes the MCP transport and reconnects with a different MCP session. The per-session cache is bounded to 50 search sessions, and the shared search cache is bounded to 500 recent sessions.
+Business state is not stored in `McpAgent` session state. The selected model and recent `web_search` session cache are stored in a separate fixed-name `GrokSearchStore` Durable Object (`idFromName("global")`). That makes `switch_model` and `get_sources(session_id)` work even when a client such as ChatGPT refreshes the MCP transport and reconnects with a different MCP session. The shared search cache keeps recent sessions for 24 hours and is bounded to 500 rows.
+
+All tools return a consistent outer shape: successful calls include `ok: true`, and failures include `ok: false` with a structured `error`.
 
 ## Tools
 
@@ -31,8 +34,6 @@ Cloudflare's `McpAgent.serve('/mcp')` handles Streamable HTTP transport. The Wor
 | `web_map` | Discovers site URLs through Tavily Map. |
 | `get_config_info` | Returns non-secret configuration diagnostics, including default, selected, and current model names. |
 
-Compatibility probe note: `get_sources`, `switch_model`, and `web_map` currently return a deliberately small `mode: "chatgpt_minimal_probe"` response. This is used to isolate ChatGPT connector transport resets from storage reads, state writes, and external Tavily calls. Re-enable the full implementations one layer at a time only after ChatGPT confirms these minimal responses no longer interrupt the tool channel.
-
 Not ported in this version: `toggle_builtin_tools`, Claude Code settings mutation, parent process monitoring, and local config-file persistence.
 
 ## Model selection
@@ -40,7 +41,7 @@ Not ported in this version: `toggle_builtin_tools`, Claude Code settings mutatio
 The Worker resolves the Grok model in this order:
 
 ```text
-current MCP session selected_model
+GrokSearchStore selected_model
   -> GROK_MODEL environment variable
   -> grok-4-fast
 ```
@@ -59,7 +60,9 @@ Use `switch_model` to change the model for the current MCP session:
 }
 ```
 
-`switch_model` is temporarily in minimal ChatGPT compatibility probe mode. It echoes the requested model but does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, does not use Agent state synchronization, does not write storage, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model.
+`switch_model` persists the selected model in `GrokSearchStore`. It does not call `GET ${GROK_API_URL}/models`, does not validate the requested model, does not use Agent state synchronization, and does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model. Use `list_models` before `switch_model` when validation is required.
+
+Switching to the configured default model clears the stored `selected_model`, so `get_config_info` returns `selected_model: null` and resolves `current_model` from `GROK_MODEL`.
 
 Search result source URLs are normalized, deduplicated, and stripped of common Markdown/citation tails before being stored.
 
@@ -141,7 +144,7 @@ If `MCP_SHARED_TOKEN` is enabled, configure the client-side authorization mechan
 2. MCP Inspector should list seven tools.
 3. `get_config_info` should show configured providers without leaking key values.
 4. `list_models` should return the model list from the configured Grok-compatible API.
-5. `switch_model` should update the current MCP session model without calling the models API.
+5. `switch_model` should persist the selected model in `GrokSearchStore` without calling the models API.
 6. `web_search` should return `answer`, `session_id`, `sources_count`, and the model used.
 7. `get_sources` should return the cached source list for the returned `session_id`, including after the MCP transport reconnects to a fresh session.
 8. `web_fetch` should return page content when Tavily or Firecrawl is configured.
