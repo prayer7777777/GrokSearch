@@ -21,13 +21,41 @@ Cloudflare's `McpAgent.serve('/mcp')` handles Streamable HTTP transport. The Wor
 
 | Tool | Purpose |
 | --- | --- |
-| `web_search` | Runs Grok/xAI web search and returns an answer plus a `session_id`. |
+| `web_search` | Runs Grok/xAI web search with the current session model and returns an answer plus a `session_id`. |
 | `get_sources` | Returns cached sources for a previous `web_search` call in the same MCP session. |
+| `list_models` | Fetches available models from the configured `GROK_API_URL` using `GROK_API_KEY`. |
+| `switch_model` | Switches the Grok model for the current MCP session without changing Worker environment variables. |
 | `web_fetch` | Fetches a page through Tavily Extract, falling back to Firecrawl Scrape. |
 | `web_map` | Discovers site URLs through Tavily Map. |
-| `get_config_info` | Returns non-secret configuration diagnostics. |
+| `get_config_info` | Returns non-secret configuration diagnostics, including default, selected, and current model names. |
 
-Not ported in this version: `toggle_builtin_tools`, `switch_model`, Claude Code settings mutation, parent process monitoring, and local config-file persistence.
+Not ported in this version: `toggle_builtin_tools`, Claude Code settings mutation, parent process monitoring, and local config-file persistence.
+
+## Model selection
+
+The Worker resolves the Grok model in this order:
+
+```text
+current MCP session selected_model
+  -> GROK_MODEL environment variable
+  -> grok-4-fast
+```
+
+Use `list_models` to inspect models exposed by the configured API endpoint:
+
+```json
+{}
+```
+
+Use `switch_model` to change the model for the current MCP session:
+
+```json
+{
+  "model": "grok-4-fast"
+}
+```
+
+`switch_model` first tries to validate the requested model against `GET ${GROK_API_URL}/models`. If that endpoint is unavailable, the tool records a warning and still switches the session model. This does not update `wrangler.jsonc`, Cloudflare secrets, or the global default model.
 
 ## Local setup
 
@@ -104,12 +132,14 @@ If `MCP_SHARED_TOKEN` is enabled, configure the client-side authorization mechan
 ## Self-check
 
 1. `curl https://<worker-host>/health` should return JSON with `ok: true`.
-2. MCP Inspector should list five tools.
+2. MCP Inspector should list seven tools.
 3. `get_config_info` should show configured providers without leaking key values.
-4. `web_search` should return `answer`, `session_id`, and `sources_count`.
-5. `get_sources` should return the cached source list from the same MCP session.
-6. `web_fetch` should return page content when Tavily or Firecrawl is configured.
-7. `web_map` should return discovered URLs when Tavily is configured.
+4. `list_models` should return the model list from the configured Grok-compatible API.
+5. `switch_model` should update the current MCP session model.
+6. `web_search` should return `answer`, `session_id`, `sources_count`, and the model used.
+7. `get_sources` should return the cached source list from the same MCP session.
+8. `web_fetch` should return page content when Tavily or Firecrawl is configured.
+9. `web_map` should return discovered URLs when Tavily is configured.
 
 ## Git-based deployment note
 
