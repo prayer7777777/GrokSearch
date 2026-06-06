@@ -2,7 +2,7 @@ import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
-export interface Env {
+export interface Env extends Cloudflare.Env {
   GROK_API_KEY?: string;
   GROK_API_URL?: string;
   GROK_MODEL?: string;
@@ -26,6 +26,13 @@ type Source = {
 
 type AgentState = {
   sessions: Record<string, { query: string; answer_preview: string; sources: Source[]; created_at: string }>;
+};
+
+type FetchResult = {
+  url: string;
+  title?: string;
+  content: string;
+  provider: "tavily" | "firecrawl";
 };
 
 const SERVER_NAME = "grok-search-cloudflare-mcp";
@@ -169,7 +176,7 @@ async function callGrok(env: Env, query: string, opts: { max_sources?: number; a
   return { answer: textFrom(response.data).trim() || "No textual answer was returned.", sources: sourcesFrom(response.data, "grok", maxSources), model };
 }
 
-async function tavilyExtract(env: Env, url: string, format: "markdown" | "text" | "html") {
+async function tavilyExtract(env: Env, url: string, format: "markdown" | "text" | "html"): Promise<FetchResult | null> {
   if (!env.TAVILY_API_KEY) return null;
   const response = await fetchJson(`${trimSlash(env.TAVILY_API_URL || "https://api.tavily.com")}/extract`, {
     method: "POST",
@@ -177,13 +184,14 @@ async function tavilyExtract(env: Env, url: string, format: "markdown" | "text" 
     body: JSON.stringify({ urls: [url], extract_depth: "advanced", format: format === "html" ? "html" : "markdown" }),
   }, 30000);
   if (!response.ok) return null;
-  const first = rec((Array.isArray(rec(response.data).results) ? rec(response.data).results : [])[0]);
+  const results = rec(response.data).results;
+  const first = rec((Array.isArray(results) ? results : [])[0]);
   const content = typeof first.raw_content === "string" ? first.raw_content : typeof first.content === "string" ? first.content : "";
   if (!content.trim()) return null;
   return { url: typeof first.url === "string" ? first.url : url, title: typeof first.title === "string" ? first.title : undefined, content, provider: "tavily" as const };
 }
 
-async function firecrawlScrape(env: Env, url: string, format: "markdown" | "text" | "html") {
+async function firecrawlScrape(env: Env, url: string, format: "markdown" | "text" | "html"): Promise<FetchResult | ReturnType<typeof fail> | null> {
   if (!env.FIRECRAWL_API_KEY) return null;
   const response = await fetchJson(`${trimSlash(env.FIRECRAWL_API_URL || "https://api.firecrawl.dev/v2")}/scrape`, {
     method: "POST",
@@ -217,7 +225,7 @@ function isAuthorized(request: Request, env: Env) {
   return request.headers.get("Authorization") === `Bearer ${env.MCP_SHARED_TOKEN}`;
 }
 
-export class GrokSearchMCP extends McpAgent {
+export class GrokSearchMCP extends McpAgent<Env, AgentState> {
   initialState: AgentState = DEFAULT_STATE;
   server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
@@ -254,7 +262,7 @@ export class GrokSearchMCP extends McpAgent {
       let normalized = "";
       try { normalized = normalizeHttpUrl(url); } catch (error) { return json(fail("invalid_input", error instanceof Error ? error.message : "Invalid URL.")); }
       if (!env.TAVILY_API_KEY && !env.FIRECRAWL_API_KEY) return json(fail("missing_config", "Configure TAVILY_API_KEY or FIRECRAWL_API_KEY to use web_fetch."));
-      let fetched = await tavilyExtract(env, normalized, format);
+      let fetched: FetchResult | ReturnType<typeof fail> | null = await tavilyExtract(env, normalized, format);
       if (!fetched) fetched = await firecrawlScrape(env, normalized, format);
       if (!fetched) return json(fail("empty_content", "The page could not be fetched or returned empty content.", { retryable: true }));
       if ("error" in fetched) return json(fetched);
